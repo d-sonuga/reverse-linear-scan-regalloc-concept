@@ -10,14 +10,19 @@ fn main() {
 }
 
 struct Allocator {
+    /// Registers available for allocation
     freeregs: Vec<PReg>,
+    /// The current locations of all virtual registers that have been encountered so far
     currloc: HashMap<VReg, Location>,
-    /// Mappings from virtual to physical registers from last instruction to the first
+    /// Mappings from virtual to physical registers from the last instruction to the first,
+    /// specifically for each input instruction
     allocation: Vec<HashMap<VReg, PReg>>,
+    /// A least recently used cache used for eviction
     lru: Lru,
     /// Available slots on the stack
     stackslots: Vec<usize>,
-    stackmoves: Vec<(usize, StackMove)>
+    /// Stack movements to be inserted for spills
+    stackmoves: Vec<(usize, StackMove)>,
 }
 
 impl Allocator {
@@ -28,10 +33,13 @@ impl Allocator {
             allocation: vec![],
             lru: Lru::new(no_of_regs as usize),
             stackslots: (0..20).rev().into_iter().collect(),
-            stackmoves: vec![]
+            stackmoves: vec![],
         }
     }
 
+    /// Main allocation loop
+    ///
+    /// Visits instructions from the last to the first and drives allocation
     fn run(&mut self, instns: &Vec<Instn>) {
         for (lineno, instn) in instns.iter().enumerate().rev() {
             self.allocation.push(HashMap::new());
@@ -65,13 +73,12 @@ impl Allocator {
         }
     }
 
+    /// Initializes the free physical registers list
     fn init_freeregs(no_of_regs: i32) -> Vec<PReg> {
-        (0..no_of_regs)
-            .into_iter()
-            .map(|n| PReg(n))
-            .collect()
+        (0..no_of_regs).into_iter().map(|n| PReg(n)).collect()
     }
 
+    /// Returns the physical register allocated to `preg`
     fn assigned_reg(&mut self, vreg: VReg) -> Option<PReg> {
         if let Some(loc) = self.currloc.get(&vreg) {
             if let Location::Reg(preg) = loc {
@@ -85,6 +92,7 @@ impl Allocator {
         }
     }
 
+    /// Allocates a physical register to `vreg`
     fn allocreg(&mut self, vreg: VReg, lineno: usize) -> PReg {
         let preg: PReg;
         if !self.freeregs.is_empty() {
@@ -98,6 +106,7 @@ impl Allocator {
         preg
     }
 
+    /// Marks the phsyical register holding `vreg` as free
     fn freealloc(&mut self, vreg: VReg) {
         if let Location::Reg(preg) = self.currloc[&vreg] {
             self.currloc.insert(vreg, Location::Unassigned);
@@ -108,6 +117,8 @@ impl Allocator {
         }
     }
 
+    /// Spills a virtual register to the stack to free up a
+    /// physical one for immediate use
     fn evictreg(&mut self, lineno: usize) -> PReg {
         let (vreg, preg) = self.lru.pop();
         let vreg = vreg.unwrap();
@@ -117,6 +128,7 @@ impl Allocator {
         preg
     }
 
+    /// Gets a new stack location for spilling
     fn new_stack_location(&mut self) -> Location {
         if self.stackslots.is_empty() {
             panic!("No more stack memory for spills");
@@ -124,26 +136,41 @@ impl Allocator {
         Location::Stack(self.stackslots.pop().unwrap() * 4)
     }
 
+    /// Specifies that an instruction to save the register holding `vreg`
+    /// to `stackloc` should be inserted before `lineno`
     fn insert_save_to_stack_instn(&mut self, lineno: usize, vreg: VReg, stackloc: usize) {
-        self.stackmoves.push((lineno, StackMove {
-            reg: if let Location::Reg(preg) = self.currloc[&vreg] { preg } else {
-                panic!("The vreg is not in a physical register")
+        self.stackmoves.push((
+            lineno,
+            StackMove {
+                reg: if let Location::Reg(preg) = self.currloc[&vreg] {
+                    preg
+                } else {
+                    panic!("The vreg is not in a physical register")
+                },
+                stackloc,
+                tostack: true,
             },
-            stackloc,
-            tostack: true
-        }))
+        ))
     }
 
+    /// Specifies that an instruction to load `reg` from `stackloc` should be inserted
+    /// after `lineno`
     fn insert_load_from_stack_instn(&mut self, lineno: usize, reg: PReg, stackloc: Location) {
-        self.stackmoves.push((lineno, StackMove {
-            reg,
-            stackloc: if let Location::Stack(slot) = stackloc { slot } else {
-                panic!("stacklock is not a stack location")
+        self.stackmoves.push((
+            lineno,
+            StackMove {
+                reg,
+                stackloc: if let Location::Stack(slot) = stackloc {
+                    slot
+                } else {
+                    panic!("stacklock is not a stack location")
+                },
+                tostack: false,
             },
-            tostack: false
-        }))
+        ))
     }
 
+    /// The allocation being done for the current instruction
     fn currline_allocation(&mut self) -> &mut HashMap<VReg, PReg> {
         let len = self.allocation.len();
         &mut self.allocation[len - 1]
@@ -167,11 +194,9 @@ impl Allocator {
                     println!("store {} {}", preg, constant);
                 }
                 Instn::BinOp { op, dest, uses } => {
-                    println!("{} {} {} {}",
-                        op,
-                        currlinealloc[dest],
-                        currlinealloc[&uses[0]],
-                        currlinealloc[&uses[1]]
+                    println!(
+                        "{} {} {} {}",
+                        op, currlinealloc[dest], currlinealloc[&uses[0]], currlinealloc[&uses[1]]
                     );
                 }
             }
@@ -185,23 +210,39 @@ impl Allocator {
     }
 }
 
+/// A least recently used cache organized as a linked list based on a vector
 struct Lru {
+    /// The list of node information
+    ///
+    /// Each node corresponds to a physical register.
+    /// The index of a node is the `address` from the perspective of the linked list.
     data: Vec<LruNode>,
-    head: usize
+    /// Index of the most recently used register
+    head: usize,
 }
 
 #[derive(Clone, Copy)]
 struct LruNode {
+    /// The previous physical register in the list
     prev: usize,
+    /// The next physical register in the list
     next: usize,
-    vreg: Option<VReg>
+    /// The virtual register that is in this physical one
+    vreg: Option<VReg>,
 }
 
 impl Lru {
     fn new(no_of_regs: usize) -> Self {
         let mut lru = Self {
             head: 0,
-            data: vec![LruNode { prev: 0, next: 0, vreg: None }; no_of_regs]
+            data: vec![
+                LruNode {
+                    prev: 0,
+                    next: 0,
+                    vreg: None
+                };
+                no_of_regs
+            ],
         };
         for i in 0..no_of_regs {
             lru.data[i].prev = i.checked_sub(1).unwrap_or(no_of_regs - 1);
@@ -210,6 +251,8 @@ impl Lru {
         lru
     }
 
+    /// Marks the physical register `i` as the most recently used
+    /// and sets `vreg` as the virtual register it contains
     fn poke(&mut self, vreg: VReg, i: PReg) {
         let i: usize = i.0.try_into().unwrap();
         self.data[i].vreg = Some(vreg);
@@ -224,32 +267,44 @@ impl Lru {
         self.head = i;
     }
 
+    /// Gets the least recently used physical register and the virtual
+    /// register it contains
     fn pop(&mut self) -> (Option<VReg>, PReg) {
         let oldest = self.data[self.head].prev;
         (self.data[oldest].vreg, PReg(oldest as i32))
     }
 
+    /// Splices out a node from the list
     fn remove(&mut self, i: usize) {
         let (iprev, inext) = (self.data[i].prev, self.data[i].next);
         self.data[iprev].next = self.data[i].next;
         self.data[inext].prev = self.data[i].prev;
     }
 
+    /// Insert node `i` before node `j` in the list
     fn insert_before(&mut self, i: usize, j: usize) {
         let prev = self.data[j].prev;
         self.data[prev].next = i;
         self.data[j].prev = i;
-        self.data[i] = LruNode { next: j, prev, vreg: self.data[i].vreg };
+        self.data[i] = LruNode {
+            next: j,
+            prev,
+            vreg: self.data[i].vreg,
+        };
     }
 
+    /// Mark `preg` as not containing any physical register
     fn remove_vreg(&mut self, preg: PReg) {
         self.data[preg.0 as usize].vreg = None;
     }
 }
 
+/// A physical register
+///
+/// They are numbered from 0 to `n`-1, where `n` is the number of
+/// physical registers
 #[derive(Clone, Copy, PartialEq)]
 struct PReg(i32);
-
 
 impl fmt::Display for PReg {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -257,14 +312,19 @@ impl fmt::Display for PReg {
     }
 }
 
+/// A virtual register
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 struct VReg(u32);
 
+/// A virtual register's location
 #[derive(Clone, Copy, PartialEq)]
 enum Location {
+    /// A physical register
     Reg(PReg),
+    /// An offset on the stack
     Stack(usize),
-    Unassigned
+    /// Not yet assigned
+    Unassigned,
 }
 
 impl From<&str> for VReg {
@@ -272,41 +332,57 @@ impl From<&str> for VReg {
         if &s[0..1] != "v" || s.len() != 2 {
             fail("Failed to parse virtual register {s}");
         }
-        VReg(s.chars().skip(1).next().unwrap().to_digit(10).unwrap_or_else(|| {
-            fail("Failed to parse virtual register {s}");
-        }))
+        VReg(
+            s.chars()
+                .skip(1)
+                .next()
+                .unwrap()
+                .to_digit(10)
+                .unwrap_or_else(|| {
+                    fail("Failed to parse virtual register {s}");
+                }),
+        )
     }
 }
 
+/// Represents an instruction to be inserted to handle a spill
+/// or restoration of a spill
 #[derive(Clone, Copy)]
 struct StackMove {
+    /// The physical register involved
     reg: PReg,
+    /// The location/offset on the stack
     stackloc: usize,
-    tostack: bool
+    /// If true, the value is moving from the register to the stack
+    tostack: bool,
 }
 
+/// An instruction in the input
 #[derive(Clone, PartialEq)]
 enum Instn {
+    /// The constant and the virtual register it's to be stored in
     Store(VReg, i32),
     BinOp {
         op: String,
         dest: VReg,
-        uses: [VReg; 2]
-    }
+        uses: [VReg; 2],
+    },
 }
 
 impl Instn {
+    /// The virtual registers that were written to in the instruction
     fn def_operands(&self) -> Vec<VReg> {
         match *self {
             Self::Store(vreg, _) => vec![vreg],
-            Self::BinOp { dest, .. } => vec![dest]
+            Self::BinOp { dest, .. } => vec![dest],
         }
     }
 
+    /// The virtual registers that were read in the instruction
     fn use_operands(&self) -> Vec<VReg> {
         match *self {
             Self::Store(_, _) => vec![],
-            Self::BinOp { uses, .. } => uses.into()
+            Self::BinOp { uses, .. } => uses.into(),
         }
     }
 }
@@ -322,15 +398,17 @@ fn parse_input(input: String) -> Vec<Instn> {
             "store" => instns.push(Instn::Store(
                 VReg::from(line[1]),
                 line[2].parse().unwrap_or_else(|_| {
-                    fail(&format!("At {lineno}, the store instruction expects a 32-bit signed integer"))
-                })
+                    fail(&format!(
+                        "At {lineno}, the store instruction expects a 32-bit signed integer"
+                    ))
+                }),
             )),
             op @ ("add" | "sub") => instns.push(Instn::BinOp {
                 op: op.into(),
                 dest: VReg::from(line[1]),
-                uses: [VReg::from(line[2]), VReg::from(line[3])]
+                uses: [VReg::from(line[2]), VReg::from(line[3])],
             }),
-            _ => fail("Input should contain only add, sub and store instructions")
+            _ => fail("Input should contain only add, sub and store instructions"),
         }
     }
     instns
@@ -343,12 +421,15 @@ fn get_input() -> (String, i32) {
     }
     let filepath = args[1].clone();
     (
-        std::fs::read_to_string(filepath).unwrap_or_else(|_| {
-            fail("Failed to read the file");
-        }).trim().into(),
+        std::fs::read_to_string(filepath)
+            .unwrap_or_else(|_| {
+                fail("Failed to read the file");
+            })
+            .trim()
+            .into(),
         args[2].parse().unwrap_or_else(|_| {
             fail("Failed to parse the number of registers");
-        })
+        }),
     )
 }
 
