@@ -1,0 +1,5 @@
+store v0 5
+store v1 6
+add v2 v0 v1
+add v3 v2 v1
+sub v4 v0 v3
